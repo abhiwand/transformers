@@ -1332,7 +1332,10 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states_text += (text_embeds,)
 
-        image_embeds = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
+        if image_embeds is None:
+            image_embeds = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
+        else:
+            image_embeds = image_embeds.permute(1,0,2) # BridgeTowerResidualAttention has batch_first=False
         if output_hidden_states:
             all_hidden_states_image += (image_embeds,)
 
