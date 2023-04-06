@@ -42,6 +42,7 @@ from .utils import (
     get_full_repo_name,
     is_accelerate_available,
     is_psutil_available,
+    is_safetensors_available,
     is_sagemaker_dp_enabled,
     is_sagemaker_mp_enabled,
     is_torch_available,
@@ -85,20 +86,6 @@ log_levels = logging.get_log_levels_dict().copy()
 trainer_log_levels = dict(**log_levels, passive=-1)
 
 
-TORCH_COMPILE_BACKENDS = [
-    "eager",
-    "aot_eager",
-    "inductor",
-    "nvfuser",
-    "aot_nvfuser",
-    "aot_cudagraphs",
-    "ofi",
-    "fx2trt",
-    "onnxrt",
-    "ipex",
-]
-
-
 def default_logdir() -> str:
     """
     Same default as PyTorch
@@ -135,6 +122,7 @@ class OptimizerNames(ExplicitEnum):
 
     ADAMW_HF = "adamw_hf"
     ADAMW_TORCH = "adamw_torch"
+    ADAMW_TORCH_FUSED = "adamw_torch_fused"
     ADAMW_TORCH_XLA = "adamw_torch_xla"
     ADAMW_APEX_FUSED = "adamw_apex_fused"
     ADAFACTOR = "adafactor"
@@ -274,6 +262,9 @@ class TrainingArguments:
         save_total_limit (`int`, *optional*):
             If a value is passed, will limit the total amount of checkpoints. Deletes the older checkpoints in
             `output_dir`.
+        save_safetensors (`bool`, *optional*, defaults to `False`):
+            Use [safetensors](https://huggingface.co/docs/safetensors) saving and loading for state dicts instead of
+            default `torch.load` and `torch.save`.
         save_on_each_node (`bool`, *optional*, defaults to `False`):
             When doing multi-node distributed training, whether to save models and checkpoints on each node, or only on
             the main one.
@@ -471,7 +462,8 @@ class TrainingArguments:
 
             The options should be separated by whitespaces.
         optim (`str` or [`training_args.OptimizerNames`], *optional*, defaults to `"adamw_hf"`):
-            The optimizer to use: adamw_hf, adamw_torch, adamw_apex_fused, adamw_anyprecision or adafactor.
+            The optimizer to use: adamw_hf, adamw_torch, adamw_torch_fused, adamw_apex_fused, adamw_anyprecision or
+            adafactor.
         optim_args (`str`, *optional*):
             Optional arguments that are supplied to AnyPrecisionAdamW.
         group_by_length (`bool`, *optional*, defaults to `False`):
@@ -550,7 +542,7 @@ class TrainingArguments:
             CUDA Out-of-Memory errors. Requires accelerate to be installed (`pip install accelerate`)
         full_determinism (`bool`, *optional*, defaults to `False`)
             If `True`, [`enable_full_determinism`] is called instead of [`set_seed`] to ensure reproducible results in
-            distributed training
+            distributed training. Important: this will negatively impact the performance, so only use it for debugging.
         torchdynamo (`str`, *optional*):
             If set, the backend compiler for TorchDynamo. Possible choices are `"eager"`, `"aot_eager"`, `"inductor"`,
             `"nvfuser"`, `"aot_nvfuser"`, `"aot_cudagraphs"`, `"ofi"`, `"fx2trt"`, `"onnxrt"` and `"ipex"`.
@@ -569,19 +561,26 @@ class TrainingArguments:
             Whether to use Apple Silicon chip based `mps` device.
         torch_compile (`bool`, *optional*, defaults to `False`):
             Whether or not to compile the model using PyTorch 2.0
-            [`torch.compile`](https://pytorch.org/get-started/pytorch-2.0/) (requires a nighlty install of PyTorch).
+            [`torch.compile`](https://pytorch.org/get-started/pytorch-2.0/).
 
-            If set, the backend will default to `"inductor"` (can be customized with `torch_compile_backend`) and the
-            mode will default to `"default"` (can be customized with `torch_compile_mode`).
+            This will use the best defaults for the [`torch.compile`
+            API](https://pytorch.org/docs/2.0/generated/torch.compile.html?highlight=torch+compile#torch.compile). You
+            can customize the defaults with the argument `torch_compile_backend` and `torch_compile_mode` but we don't
+            guarantee any of them will work as the support is progressively rolled in in PyTorch.
+
+            This flag and the whole compile API is experimental and subject to change in future releases.
         torch_compile_backend (`str`, *optional*):
             The backend to use in `torch.compile`. If set to any value, `torch_compile` will be set to `True`.
 
-            Possible choices are `"eager"`, `"aot_eager"`, `"inductor"`, `"nvfuser"`, `"aot_nvfuser"`,
-            `"aot_cudagraphs"`, `"ofi"`, `"fx2trt"`, `"onnxrt"` and `"ipex"`.
+            Refer to the PyTorch doc for possible values and note that they may change across PyTorch versions.
+
+            This flag is experimental and subject to change in future releases.
         torch_compile_mode (`str`, *optional*):
             The mode to use in `torch.compile`. If set to any value, `torch_compile` will be set to `True`.
 
-            Possible choices are `"default"`, `"reduce-overhead"` and `"max-autotune"`.
+            Refer to the PyTorch doc for possible values and note that they may change across PyTorch versions.
+
+            This flag is experimental and subject to change in future releases.
     """
 
     framework = "pt"
@@ -723,6 +722,12 @@ class TrainingArguments:
                 "Limit the total amount of checkpoints. "
                 "Deletes the older checkpoints in the output_dir. Default is unlimited checkpoints"
             )
+        },
+    )
+    save_safetensors: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use safetensors saving and loading for state dicts instead of default torch.load and torch.save."
         },
     )
     save_on_each_node: bool = field(
@@ -947,8 +952,15 @@ class TrainingArguments:
     label_smoothing_factor: float = field(
         default=0.0, metadata={"help": "The label smoothing epsilon to apply (zero means no label smoothing)."}
     )
+
+    default_optim = "adamw_hf"
+    # XXX: enable when pytorch==2.0.1 comes out - we want to give it time to get all the bugs sorted out
+    # if is_torch_available() and version.parse(version.parse(torch.__version__).base_version) >= version.parse("2.1.0"):
+    #     default_optim = "adamw_torch_fused"
+    # and update the doc above to:
+    # optim (`str` or [`training_args.OptimizerNames`], *optional*, defaults to `"adamw_torch_fused"` (for torch<2.1.0 `"adamw_hf"`):
     optim: Union[OptimizerNames, str] = field(
-        default="adamw_hf",
+        default=default_optim,
         metadata={"help": "The optimizer to use."},
     )
     optim_args: Optional[str] = field(default=None, metadata={"help": "Optional arguments to supply to optimizer."})
@@ -1053,7 +1065,7 @@ class TrainingArguments:
         metadata={
             "help": (
                 "Whether to call enable_full_determinism instead of set_seed for reproducibility in distributed"
-                " training"
+                " training. Important: this will negatively impact the performance, so only use it for debugging."
             )
         },
     )
@@ -1061,7 +1073,6 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": "This argument is deprecated, use `--torch_compile_backend` instead.",
-            "choices": TORCH_COMPILE_BACKENDS,
         },
     )
     ray_scope: Optional[str] = field(
@@ -1090,14 +1101,12 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": "Which backend to use with `torch.compile`, passing one will trigger a model compilation.",
-            "choices": TORCH_COMPILE_BACKENDS,
         },
     )
     torch_compile_mode: Optional[str] = field(
         default=None,
         metadata={
             "help": "Which mode to use with `torch.compile`, passing one will trigger a model compilation.",
-            "choices": ["default", "reduce-overhead", "max-autotune"],
         },
     )
 
@@ -1167,6 +1176,17 @@ class TrainingArguments:
                     f"steps, but found {self.save_steps}, which is not a round multiple of {self.eval_steps}."
                 )
 
+        safetensors_available = is_safetensors_available()
+        if self.save_safetensors and not safetensors_available:
+            raise ValueError(f"--save_safetensors={self.save_safetensors} requires safetensors to be installed!")
+        if not self.save_safetensors and safetensors_available:
+            logger.info(
+                f"Found safetensors installation, but --save_safetensors={self.save_safetensors}. "
+                f"Safetensors should be a preferred weights saving format due to security and performance reasons. "
+                f"If your model cannot be saved by safetensors please feel free to open an issue at "
+                f"https://github.com/huggingface/safetensors!"
+            )
+
         if self.load_best_model_at_end and self.metric_for_best_model is None:
             self.metric_for_best_model = "loss"
         if self.greater_is_better is None and self.metric_for_best_model is not None:
@@ -1215,6 +1235,12 @@ class TrainingArguments:
                 FutureWarning,
             )
             self.optim = OptimizerNames.ADAFACTOR
+        if self.optim == OptimizerNames.ADAMW_TORCH_FUSED and is_torch_available():
+            if version.parse(version.parse(torch.__version__).base_version) < version.parse("2.0.0"):
+                raise ValueError("--optim adamw_torch_fused requires PyTorch 2.0 or higher")
+            # there is a bug in fp16/AMP in pt-2.0.0
+            if version.parse(version.parse(torch.__version__).base_version) == version.parse("2.0.0") and self.fp16:
+                raise ValueError("--optim adamw_torch_fused with --fp16 requires PyTorch>2.0")
 
         if (
             self.framework == "pt"
@@ -1636,7 +1662,10 @@ class TrainingArguments:
             # Here, we'll use torch.distributed.
             # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
             if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(backend="nccl", timeout=self.ddp_timeout_delta)
+                if self.xpu_backend and self.xpu_backend in ("mpi", "gloo"):
+                    torch.distributed.init_process_group(backend=self.xpu_backend, timeout=self.ddp_timeout_delta)
+                else:
+                    torch.distributed.init_process_group(backend="nccl", timeout=self.ddp_timeout_delta)
             device = torch.device("cuda", self.local_rank)
             self._n_gpu = 1
 
@@ -2285,8 +2314,8 @@ class TrainingArguments:
 
         Args:
             name (`str` or [`training_args.OptimizerNames`], *optional*, defaults to `"adamw_hf"`):
-                The optimizer to use: `"adamw_hf"`, `"adamw_torch"`, `"adamw_apex_fused"`, `"adamw_anyprecision"` or
-                `"adafactor"`.
+                The optimizer to use: `"adamw_hf"`, `"adamw_torch"`, `"adamw_torch_fused"`, `"adamw_apex_fused"`,
+                `"adamw_anyprecision"` or `"adafactor"`.
             learning_rate (`float`, *optional*, defaults to 5e-5):
                 The initial learning rate.
             weight_decay (`float`, *optional*, defaults to 0):

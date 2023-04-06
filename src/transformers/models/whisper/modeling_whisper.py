@@ -14,7 +14,6 @@
 # limitations under the License.
 """ PyTorch Whisper model."""
 
-
 import math
 import random
 from typing import Optional, Tuple, Union
@@ -37,6 +36,7 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_whisper import WhisperConfig
+from .tokenization_whisper import TASK_IDS, TO_LANGUAGE_CODE
 
 
 logger = logging.get_logger(__name__)
@@ -69,18 +69,20 @@ def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
-def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
+def _make_causal_mask(
+    input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+):
     """
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
-    mask_cond = torch.arange(mask.size(-1))
+    mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min, device=device), device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 
@@ -575,7 +577,7 @@ class WhisperPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     main_input_name = "input_features"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["WhisperEncoderLayer"]
+    _no_split_modules = ["WhisperEncoderLayer", "WhisperDecoderLayer"]
 
     def _init_weights(self, module):
         std = self.config.init_std
@@ -767,6 +769,12 @@ class WhisperEncoder(WhisperPreTrainedModel):
             param.requires_grad = False
         self._requires_grad = False
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.conv1
+
+    def set_input_embeddings(self, value: nn.Module):
+        self.conv1 = value
+
     def forward(
         self,
         input_features,
@@ -911,8 +919,11 @@ class WhisperDecoder(WhisperPreTrainedModel):
 
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
-                input_shape, inputs_embeds.dtype, past_key_values_length=past_key_values_length
-            ).to(inputs_embeds.device)
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -1023,7 +1034,10 @@ class WhisperDecoder(WhisperPreTrainedModel):
         )
 
         # embed positions
-        positions = self.embed_positions(input_ids, past_key_values_length=past_key_values_length)
+        if input_ids is not None:
+            positions = self.embed_positions(input_ids, past_key_values_length=past_key_values_length)
+        else:
+            positions = self.embed_positions(inputs_embeds, past_key_values_length=past_key_values_length)
 
         hidden_states = inputs_embeds + positions
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -1330,6 +1344,9 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.proj_out = new_embeddings
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
+
     def freeze_encoder(self):
         """
         Calling this function will disable the gradient computation for the Whisper encoder so that its parameters will
@@ -1498,8 +1515,8 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
                 Task to use for generation, either "translate" or "transcribe". The `model.config.forced_decoder_ids`
                 will be updated accordingly.
             language (`bool`, *optional*):
-                Language token to use for generation, should be in the form `<|en|>`. You can find all the possible
-                language tokens in the `model.generation_config.lang_to_id` dictionary.
+                Language token to use for generation, can be either in the form of `<|en|>`, `en` or `english`. You can
+                find all the possible language tokens in the `model.generation_config.lang_to_id` dictionary.
             is_multilingual (`bool`, *optional*):
                 Whether or not the model is multilingual.
             kwargs:
@@ -1531,38 +1548,62 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
             generation_config = self.generation_config
 
         if return_timestamps is not None:
+            if not hasattr(generation_config, "no_timestamps_token_id"):
+                raise ValueError(
+                    "You are trying to return timestamps, but the generation config is not properly set."
+                    "Make sure to initialize the generation config with the correct attributes that are needed such as `no_timestamps_token_id`."
+                    "For more details on how to generate the approtiate config, refer to https://github.com/huggingface/transformers/issues/21878#issuecomment-1451902363"
+                )
+
             generation_config.return_timestamps = return_timestamps
-
-        if task is not None:
-            generation_config.task = task
-
-        if is_multilingual is not None:
-            generation_config.is_multilingual = is_multilingual
+        else:
+            generation_config.return_timestamps = False
 
         if language is not None:
             generation_config.language = language
+        if task is not None:
+            generation_config.task = task
 
         forced_decoder_ids = []
-
-        if hasattr(generation_config, "is_multilingual") and generation_config.is_multilingual:
+        if task is not None or language is not None:
             if hasattr(generation_config, "language"):
-                forced_decoder_ids.append((1, generation_config.lang_to_id[generation_config.language]))
+                if generation_config.language in generation_config.lang_to_id.keys():
+                    language_token = generation_config.language
+                elif generation_config.language in TO_LANGUAGE_CODE.keys():
+                    language_token = f"<|{TO_LANGUAGE_CODE[generation_config.language]}|>"
+                else:
+                    raise ValueError(
+                        f"Unsupported language: {self.language}. Language should be one of:"
+                        f" {list(TO_LANGUAGE_CODE.keys()) if generation_config.language in TO_LANGUAGE_CODE.keys() else list(TO_LANGUAGE_CODE.values())}."
+                    )
+                forced_decoder_ids.append((1, generation_config.lang_to_id[language_token]))
             else:
-                forced_decoder_ids.append((1, None))
+                forced_decoder_ids.append((1, None))  # automatically detect the language
 
             if hasattr(generation_config, "task"):
-                forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
+                if generation_config.task in TASK_IDS:
+                    forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
+                else:
+                    raise ValueError(
+                        f"The `{generation_config.task}`task is not supported. The task should be one of `{TASK_IDS}`"
+                    )
             else:
-                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
-
-        if (
-            hasattr(generation_config, "return_timestamps") and generation_config.return_timestamps
-        ) or return_timestamps:
-            logits_processor = [WhisperTimeStampLogitsProcessor(generation_config)]
-        else:
-            if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
+                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))  # defaults to transcribe
+            if hasattr(generation_config, "no_timestamps_token_id") and not generation_config.return_timestamps:
                 idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
                 forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
+
+        # Legacy code for backward compatibility
+        elif hasattr(self.config, "forced_decoder_ids") and self.config.forced_decoder_ids is not None:
+            forced_decoder_ids = self.config.forced_decoder_ids
+        elif (
+            hasattr(self.generation_config, "forced_decoder_ids")
+            and self.generation_config.forced_decoder_ids is not None
+        ):
+            forced_decoder_ids = self.generation_config.forced_decoder_ids
+
+        if generation_config.return_timestamps:
+            logits_processor = [WhisperTimeStampLogitsProcessor(generation_config)]
 
         if len(forced_decoder_ids) > 0:
             generation_config.forced_decoder_ids = forced_decoder_ids
@@ -1634,6 +1675,12 @@ class WhisperForAudioClassification(WhisperPreTrainedModel):
         not be updated during training. Only the projection layers and classification head will be updated.
         """
         self.encoder._freeze_parameters()
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.encoder.get_input_embeddings()
+
+    def set_input_embeddings(self, value: nn.Module):
+        self.encoder.set_input_embeddings(value)
 
     @add_start_docstrings_to_model_forward(WHISPER_ENCODER_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=SequenceClassifierOutput, config_class=_CONFIG_FOR_DOC)
